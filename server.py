@@ -15,20 +15,22 @@ import logging
 import time
 import asyncio
 from typing import Optional, List, Dict, Any
-from enum import Enum
+
 import httpx
-from pydantic import BaseModel, Field, ConfigDict, field_validator
-from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field, ConfigDict
+from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.dependencies import get_http_headers
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-SHOPIFY_STORE        = os.environ.get("SHOPIFY_STORE", "")           # e.g. "my-store"
-SHOPIFY_TOKEN        = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")    # Static token (shpat_...)
-SHOPIFY_CLIENT_ID    = os.environ.get("SHOPIFY_CLIENT_ID", "")
-SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
-API_VERSION          = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+SHOPIFY_STORE          = os.environ.get("SHOPIFY_STORE", "")           # e.g. "my-store"
+SHOPIFY_TOKEN          = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")    # Static token (shpat_...)
+SHOPIFY_CLIENT_ID      = os.environ.get("SHOPIFY_CLIENT_ID", "")
+SHOPIFY_CLIENT_SECRET  = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+API_VERSION            = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 # Refresh buffer: refresh token 30 minutes before expiry (only used with OAuth)
 TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
@@ -36,25 +38,24 @@ TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("shopify_mcp")
 
-PORT          = int(os.environ.get("PORT", "8000"))
+PORT = int(os.environ.get("PORT", "8000"))
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "streamable-http")
-
-mcp = FastMCP("shopify_mcp", host="0.0.0.0", port=PORT, json_response=True)
-import secrets
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
-
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if BEARER_TOKEN:
-            auth = request.headers.get("Authorization", "")
-            if auth != f"Bearer {BEARER_TOKEN}":
-                return Response("Unauthorized", status_code=401)
-        return await call_next(request)
+mcp = FastMCP("shopify_mcp", host="0.0.0.0", port=PORT, json_response=True)
 
-mcp.app.add_middleware(BearerAuthMiddleware)
+
+class BearerAuthMiddleware(Middleware):
+    async def on_request(self, context: MiddlewareContext, call_next):
+        if BEARER_TOKEN:
+            headers = get_http_headers() or {}
+            auth = headers.get("authorization", "")
+            if auth != f"Bearer {BEARER_TOKEN}":
+                raise PermissionError("Unauthorized")
+        return await call_next(context)
+
+
+mcp.add_middleware(BearerAuthMiddleware())
 
 # ---------------------------------------------------------------------------
 # Token Manager — handles automatic token lifecycle
@@ -78,14 +79,14 @@ class TokenManager:
         static_token: str = "",
         refresh_buffer: int = 1800,
     ):
-        self._store         = store
-        self._client_id     = client_id
+        self._store = store
+        self._client_id = client_id
         self._client_secret = client_secret
-        self._static_token  = static_token
+        self._static_token = static_token
         self._refresh_buffer = refresh_buffer
 
-        self._access_token: str   = ""
-        self._expires_at: float   = 0.0
+        self._access_token: str = ""
+        self._expires_at: float = 0.0
         self._lock = asyncio.Lock()
 
         self._use_client_credentials = bool(client_id and client_secret)
@@ -95,7 +96,7 @@ class TokenManager:
         elif static_token:
             logger.info("Token mode: static SHOPIFY_ACCESS_TOKEN (no auto-refresh)")
             self._access_token = static_token
-            self._expires_at   = float("inf")
+            self._expires_at = float("inf")
         else:
             logger.warning(
                 "No credentials configured. Set SHOPIFY_ACCESS_TOKEN or "
@@ -144,8 +145,8 @@ class TokenManager:
             resp = await client.post(
                 url,
                 data={
-                    "grant_type":    "client_credentials",
-                    "client_id":     self._client_id,
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_id,
                     "client_secret": self._client_secret,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -159,12 +160,12 @@ class TokenManager:
                     "Check SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET."
                 )
 
-            data               = resp.json()
+            data = resp.json()
             self._access_token = data["access_token"]
-            expires_in         = data.get("expires_in", 86399)
-            self._expires_at   = time.time() + expires_in
+            expires_in = data.get("expires_in", 86399)
+            self._expires_at = time.time() + expires_in
 
-            scope         = data.get("scope", "")
+            scope = data.get("scope", "")
             scope_preview = scope[:80] + "..." if len(scope) > 80 else scope
             logger.info(
                 f"Token refreshed. Expires in {expires_in}s "
@@ -203,7 +204,7 @@ async def _request(
     method: str,
     path: str,
     params: Optional[dict] = None,
-    body:   Optional[dict] = None,
+    body: Optional[dict] = None,
     _retried: bool = False,
 ) -> dict:
     """Central HTTP helper — every API call flows through here.
@@ -215,12 +216,13 @@ async def _request(
             "Set it before starting the server."
         )
 
-    url     = f"{_base_url()}/{path}"
+    url = f"{_base_url()}/{path}"
     headers = await _headers()
 
     async with httpx.AsyncClient() as client:
         resp = await client.request(
-            method, url,
+            method,
+            url,
             headers=headers,
             params=params,
             json=body,
@@ -257,6 +259,8 @@ def _error(e: Exception) -> str:
         return "Request timed out — try again."
     if isinstance(e, RuntimeError):
         return str(e)
+    if isinstance(e, PermissionError):
+        return str(e)
     return f"Unexpected error: {type(e).__name__}: {e}"
 
 
@@ -270,13 +274,13 @@ def _fmt(data: Any) -> str:
 
 class ListProductsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    limit:          Optional[int]  = Field(default=50, ge=1, le=250, description="Max products to return (1-250)")
-    status:         Optional[str]  = Field(default=None, description="Filter by status: active, archived, draft")
-    product_type:   Optional[str]  = Field(default=None, description="Filter by product type")
-    vendor:         Optional[str]  = Field(default=None, description="Filter by vendor name")
-    collection_id:  Optional[int]  = Field(default=None, description="Filter by collection ID")
-    since_id:       Optional[int]  = Field(default=None, description="Pagination: return products after this ID")
-    fields:         Optional[str]  = Field(default=None, description="Comma-separated fields to include")
+    limit: Optional[int] = Field(default=50, ge=1, le=250, description="Max products to return (1-250)")
+    status: Optional[str] = Field(default=None, description="Filter by status: active, archived, draft")
+    product_type: Optional[str] = Field(default=None, description="Filter by product type")
+    vendor: Optional[str] = Field(default=None, description="Filter by vendor name")
+    collection_id: Optional[int] = Field(default=None, description="Filter by collection ID")
+    since_id: Optional[int] = Field(default=None, description="Pagination: return products after this ID")
+    fields: Optional[str] = Field(default=None, description="Comma-separated fields to include")
 
 
 @mcp.tool(
@@ -291,7 +295,7 @@ async def shopify_list_products(params: ListProductsInput) -> str:
             val = getattr(params, field)
             if val is not None:
                 p[field] = val
-        data     = await _request("GET", "products.json", params=p)
+        data = await _request("GET", "products.json", params=p)
         products = data.get("products", [])
         return _fmt({"count": len(products), "products": products})
     except Exception as e:
@@ -318,15 +322,15 @@ async def shopify_get_product(params: GetProductInput) -> str:
 
 class CreateProductInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    title:        str                        = Field(..., min_length=1, description="Product title")
-    body_html:    Optional[str]              = Field(default=None, description="HTML description")
-    vendor:       Optional[str]              = Field(default=None)
-    product_type: Optional[str]              = Field(default=None)
-    tags:         Optional[str]              = Field(default=None, description="Comma-separated tags")
-    status:       Optional[str]              = Field(default="draft", description="active, archived, or draft")
-    variants:     Optional[List[Dict[str, Any]]] = Field(default=None, description="Variant objects with price, sku, etc.")
-    options:      Optional[List[Dict[str, Any]]] = Field(default=None, description="Product options (Size, Color, etc.)")
-    images:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Image objects with src URL")
+    title: str = Field(..., min_length=1, description="Product title")
+    body_html: Optional[str] = Field(default=None, description="HTML description")
+    vendor: Optional[str] = Field(default=None)
+    product_type: Optional[str] = Field(default=None)
+    tags: Optional[str] = Field(default=None, description="Comma-separated tags")
+    status: Optional[str] = Field(default="draft", description="active, archived, or draft")
+    variants: Optional[List[Dict[str, Any]]] = Field(default=None, description="Variant objects with price, sku, etc.")
+    options: Optional[List[Dict[str, Any]]] = Field(default=None, description="Product options (Size, Color, etc.)")
+    images: Optional[List[Dict[str, Any]]] = Field(default=None, description="Image objects with src URL")
 
 
 @mcp.tool(
@@ -349,14 +353,14 @@ async def shopify_create_product(params: CreateProductInput) -> str:
 
 class UpdateProductInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    product_id:   int            = Field(..., description="Product ID to update")
-    title:        Optional[str]  = Field(default=None)
-    body_html:    Optional[str]  = Field(default=None)
-    vendor:       Optional[str]  = Field(default=None)
-    product_type: Optional[str]  = Field(default=None)
-    tags:         Optional[str]  = Field(default=None)
-    status:       Optional[str]  = Field(default=None, description="active, archived, or draft")
-    variants:     Optional[List[Dict[str, Any]]] = Field(default=None)
+    product_id: int = Field(..., description="Product ID to update")
+    title: Optional[str] = Field(default=None)
+    body_html: Optional[str] = Field(default=None)
+    vendor: Optional[str] = Field(default=None)
+    product_type: Optional[str] = Field(default=None)
+    tags: Optional[str] = Field(default=None)
+    status: Optional[str] = Field(default=None, description="active, archived, or draft")
+    variants: Optional[List[Dict[str, Any]]] = Field(default=None)
 
 
 @mcp.tool(
@@ -397,8 +401,8 @@ async def shopify_delete_product(params: DeleteProductInput) -> str:
 
 class ProductCountInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    status:       Optional[str] = Field(default=None, description="active, archived, or draft")
-    vendor:       Optional[str] = Field(default=None)
+    status: Optional[str] = Field(default=None, description="active, archived, or draft")
+    vendor: Optional[str] = Field(default=None)
     product_type: Optional[str] = Field(default=None)
 
 
@@ -426,14 +430,14 @@ async def shopify_count_products(params: ProductCountInput) -> str:
 
 class ListOrdersInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    limit:               Optional[int] = Field(default=50, ge=1, le=250)
-    status:              Optional[str] = Field(default="any", description="open, closed, cancelled, any")
-    financial_status:    Optional[str] = Field(default=None, description="authorized, pending, paid, refunded, voided, any")
-    fulfillment_status:  Optional[str] = Field(default=None, description="shipped, partial, unshipped, unfulfilled, any")
-    since_id:            Optional[int] = Field(default=None)
-    created_at_min:      Optional[str] = Field(default=None, description="ISO 8601 date, e.g. 2024-01-01T00:00:00Z")
-    created_at_max:      Optional[str] = Field(default=None)
-    fields:              Optional[str] = Field(default=None)
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
+    status: Optional[str] = Field(default="any", description="open, closed, cancelled, any")
+    financial_status: Optional[str] = Field(default=None, description="authorized, pending, paid, refunded, voided, any")
+    fulfillment_status: Optional[str] = Field(default=None, description="shipped, partial, unshipped, unfulfilled, any")
+    since_id: Optional[int] = Field(default=None)
+    created_at_min: Optional[str] = Field(default=None, description="ISO 8601 date, e.g. 2024-01-01T00:00:00Z")
+    created_at_max: Optional[str] = Field(default=None)
+    fields: Optional[str] = Field(default=None)
 
 
 @mcp.tool(
@@ -448,7 +452,7 @@ async def shopify_list_orders(params: ListOrdersInput) -> str:
             val = getattr(params, field)
             if val is not None:
                 p[field] = val
-        data   = await _request("GET", "orders.json", params=p)
+        data = await _request("GET", "orders.json", params=p)
         orders = data.get("orders", [])
         return _fmt({"count": len(orders), "orders": orders})
     except Exception as e:
@@ -475,8 +479,8 @@ async def shopify_get_order(params: GetOrderInput) -> str:
 
 class OrderCountInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    status:             Optional[str] = Field(default="any")
-    financial_status:   Optional[str] = Field(default=None)
+    status: Optional[str] = Field(default="any")
+    financial_status: Optional[str] = Field(default=None)
     fulfillment_status: Optional[str] = Field(default=None)
 
 
@@ -518,10 +522,10 @@ async def shopify_close_order(params: CloseOrderInput) -> str:
 
 class CancelOrderInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    order_id: int            = Field(..., description="Order ID to cancel")
-    reason:   Optional[str]  = Field(default=None, description="customer, fraud, inventory, declined, other")
-    email:    Optional[bool] = Field(default=True,  description="Send cancellation email to customer")
-    restock:  Optional[bool] = Field(default=False, description="Restock line items")
+    order_id: int = Field(..., description="Order ID to cancel")
+    reason: Optional[str] = Field(default=None, description="customer, fraud, inventory, declined, other")
+    email: Optional[bool] = Field(default=True, description="Send cancellation email to customer")
+    restock: Optional[bool] = Field(default=False, description="Restock line items")
 
 
 @mcp.tool(
@@ -548,11 +552,11 @@ async def shopify_cancel_order(params: CancelOrderInput) -> str:
 
 class ListCustomersInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    limit:          Optional[int] = Field(default=50, ge=1, le=250)
-    since_id:       Optional[int] = Field(default=None)
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
+    since_id: Optional[int] = Field(default=None)
     created_at_min: Optional[str] = Field(default=None, description="ISO 8601 date")
     created_at_max: Optional[str] = Field(default=None)
-    fields:         Optional[str] = Field(default=None)
+    fields: Optional[str] = Field(default=None)
 
 
 @mcp.tool(
@@ -567,7 +571,7 @@ async def shopify_list_customers(params: ListCustomersInput) -> str:
             val = getattr(params, f)
             if val is not None:
                 p[f] = val
-        data      = await _request("GET", "customers.json", params=p)
+        data = await _request("GET", "customers.json", params=p)
         customers = data.get("customers", [])
         return _fmt({"count": len(customers), "customers": customers})
     except Exception as e:
@@ -576,7 +580,7 @@ async def shopify_list_customers(params: ListCustomersInput) -> str:
 
 class SearchCustomersInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    query: str           = Field(..., min_length=1, description="Search query (name, email, etc.)")
+    query: str = Field(..., min_length=1, description="Search query (name, email, etc.)")
     limit: Optional[int] = Field(default=50, ge=1, le=250)
 
 
@@ -587,8 +591,8 @@ class SearchCustomersInput(BaseModel):
 async def shopify_search_customers(params: SearchCustomersInput) -> str:
     """Search customers by name, email, or other fields."""
     try:
-        p         = {"query": params.query, "limit": params.limit}
-        data      = await _request("GET", "customers/search.json", params=p)
+        p = {"query": params.query, "limit": params.limit}
+        data = await _request("GET", "customers/search.json", params=p)
         customers = data.get("customers", [])
         return _fmt({"count": len(customers), "customers": customers})
     except Exception as e:
@@ -615,14 +619,14 @@ async def shopify_get_customer(params: GetCustomerInput) -> str:
 
 class CreateCustomerInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    first_name:         Optional[str]  = Field(default=None)
-    last_name:          Optional[str]  = Field(default=None)
-    email:              Optional[str]  = Field(default=None)
-    phone:              Optional[str]  = Field(default=None)
-    tags:               Optional[str]  = Field(default=None)
-    note:               Optional[str]  = Field(default=None)
-    addresses:          Optional[List[Dict[str, Any]]] = Field(default=None)
-    send_email_invite:  Optional[bool] = Field(default=False)
+    first_name: Optional[str] = Field(default=None)
+    last_name: Optional[str] = Field(default=None)
+    email: Optional[str] = Field(default=None)
+    phone: Optional[str] = Field(default=None)
+    tags: Optional[str] = Field(default=None)
+    note: Optional[str] = Field(default=None)
+    addresses: Optional[List[Dict[str, Any]]] = Field(default=None)
+    send_email_invite: Optional[bool] = Field(default=False)
 
 
 @mcp.tool(
@@ -645,13 +649,13 @@ async def shopify_create_customer(params: CreateCustomerInput) -> str:
 
 class UpdateCustomerInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    customer_id: int           = Field(..., description="Customer ID to update")
-    first_name:  Optional[str] = Field(default=None)
-    last_name:   Optional[str] = Field(default=None)
-    email:       Optional[str] = Field(default=None)
-    phone:       Optional[str] = Field(default=None)
-    tags:        Optional[str] = Field(default=None)
-    note:        Optional[str] = Field(default=None)
+    customer_id: int = Field(..., description="Customer ID to update")
+    first_name: Optional[str] = Field(default=None)
+    last_name: Optional[str] = Field(default=None)
+    email: Optional[str] = Field(default=None)
+    phone: Optional[str] = Field(default=None)
+    tags: Optional[str] = Field(default=None)
+    note: Optional[str] = Field(default=None)
 
 
 @mcp.tool(
@@ -674,9 +678,9 @@ async def shopify_update_customer(params: UpdateCustomerInput) -> str:
 
 class CustomerOrdersInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    customer_id: int           = Field(..., description="Customer ID")
-    limit:       Optional[int] = Field(default=50, ge=1, le=250)
-    status:      Optional[str] = Field(default="any")
+    customer_id: int = Field(..., description="Customer ID")
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
+    status: Optional[str] = Field(default="any")
 
 
 @mcp.tool(
@@ -686,8 +690,8 @@ class CustomerOrdersInput(BaseModel):
 async def shopify_get_customer_orders(params: CustomerOrdersInput) -> str:
     """Get all orders for a specific customer."""
     try:
-        p      = {"limit": params.limit, "status": params.status}
-        data   = await _request("GET", f"customers/{params.customer_id}/orders.json", params=p)
+        p = {"limit": params.limit, "status": params.status}
+        data = await _request("GET", f"customers/{params.customer_id}/orders.json", params=p)
         orders = data.get("orders", [])
         return _fmt({"count": len(orders), "orders": orders})
     except Exception as e:
@@ -700,8 +704,8 @@ async def shopify_get_customer_orders(params: CustomerOrdersInput) -> str:
 
 class ListCollectionsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    limit:           Optional[int] = Field(default=50, ge=1, le=250)
-    since_id:        Optional[int] = Field(default=None)
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
+    since_id: Optional[int] = Field(default=None)
     collection_type: Optional[str] = Field(default="custom", description="'custom' or 'smart'")
 
 
@@ -717,7 +721,7 @@ async def shopify_list_collections(params: ListCollectionsInput) -> str:
         if params.since_id:
             p["since_id"] = params.since_id
         data = await _request("GET", endpoint, params=p)
-        key  = "custom_collections" if params.collection_type == "custom" else "smart_collections"
+        key = "custom_collections" if params.collection_type == "custom" else "smart_collections"
         collections = data.get(key, [])
         return _fmt({"count": len(collections), "collections": collections})
     except Exception as e:
@@ -726,8 +730,8 @@ async def shopify_list_collections(params: ListCollectionsInput) -> str:
 
 class GetCollectionProductsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    collection_id: int           = Field(..., description="Collection ID")
-    limit:         Optional[int] = Field(default=50, ge=1, le=250)
+    collection_id: int = Field(..., description="Collection ID")
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
 
 
 @mcp.tool(
@@ -737,8 +741,8 @@ class GetCollectionProductsInput(BaseModel):
 async def shopify_get_collection_products(params: GetCollectionProductsInput) -> str:
     """Get all products in a specific collection."""
     try:
-        p        = {"limit": params.limit, "collection_id": params.collection_id}
-        data     = await _request("GET", "products.json", params=p)
+        p = {"limit": params.limit, "collection_id": params.collection_id}
+        data = await _request("GET", "products.json", params=p)
         products = data.get("products", [])
         return _fmt({"count": len(products), "products": products})
     except Exception as e:
@@ -760,7 +764,7 @@ class ListInventoryLocationsInput(BaseModel):
 async def shopify_list_locations(params: ListInventoryLocationsInput) -> str:
     """List all inventory locations for the store."""
     try:
-        data      = await _request("GET", "locations.json")
+        data = await _request("GET", "locations.json")
         locations = data.get("locations", [])
         return _fmt({"count": len(locations), "locations": locations})
     except Exception as e:
@@ -769,8 +773,8 @@ async def shopify_list_locations(params: ListInventoryLocationsInput) -> str:
 
 class GetInventoryLevelsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    location_id:         Optional[int] = Field(default=None, description="Filter by location ID")
-    inventory_item_ids:  Optional[str] = Field(default=None, description="Comma-separated inventory item IDs")
+    location_id: Optional[int] = Field(default=None, description="Filter by location ID")
+    inventory_item_ids: Optional[str] = Field(default=None, description="Comma-separated inventory item IDs")
 
 
 @mcp.tool(
@@ -785,7 +789,7 @@ async def shopify_get_inventory_levels(params: GetInventoryLevelsInput) -> str:
             p["location_ids"] = params.location_id
         if params.inventory_item_ids:
             p["inventory_item_ids"] = params.inventory_item_ids
-        data   = await _request("GET", "inventory_levels.json", params=p)
+        data = await _request("GET", "inventory_levels.json", params=p)
         levels = data.get("inventory_levels", [])
         return _fmt({"count": len(levels), "inventory_levels": levels})
     except Exception as e:
@@ -795,8 +799,8 @@ async def shopify_get_inventory_levels(params: GetInventoryLevelsInput) -> str:
 class SetInventoryLevelInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     inventory_item_id: int = Field(..., description="Inventory item ID")
-    location_id:       int = Field(..., description="Location ID")
-    available:         int = Field(..., description="Available quantity to set")
+    location_id: int = Field(..., description="Location ID")
+    available: int = Field(..., description="Available quantity to set")
 
 
 @mcp.tool(
@@ -808,8 +812,8 @@ async def shopify_set_inventory_level(params: SetInventoryLevelInput) -> str:
     try:
         body = {
             "inventory_item_id": params.inventory_item_id,
-            "location_id":       params.location_id,
-            "available":         params.available,
+            "location_id": params.location_id,
+            "available": params.available,
         }
         data = await _request("POST", "inventory_levels/set.json", body=body)
         return _fmt(data.get("inventory_level", data))
@@ -823,8 +827,8 @@ async def shopify_set_inventory_level(params: SetInventoryLevelInput) -> str:
 
 class ListFulfillmentsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    order_id: int           = Field(..., description="Order ID")
-    limit:    Optional[int] = Field(default=50, ge=1, le=250)
+    order_id: int = Field(..., description="Order ID")
+    limit: Optional[int] = Field(default=50, ge=1, le=250)
 
 
 @mcp.tool(
@@ -834,8 +838,8 @@ class ListFulfillmentsInput(BaseModel):
 async def shopify_list_fulfillments(params: ListFulfillmentsInput) -> str:
     """List fulfillments for a specific order."""
     try:
-        p            = {"limit": params.limit}
-        data         = await _request("GET", f"orders/{params.order_id}/fulfillments.json", params=p)
+        p = {"limit": params.limit}
+        data = await _request("GET", f"orders/{params.order_id}/fulfillments.json", params=p)
         fulfillments = data.get("fulfillments", [])
         return _fmt({"count": len(fulfillments), "fulfillments": fulfillments})
     except Exception as e:
@@ -844,13 +848,13 @@ async def shopify_list_fulfillments(params: ListFulfillmentsInput) -> str:
 
 class CreateFulfillmentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    order_id:         int                        = Field(..., description="Order ID to fulfill")
-    location_id:      int                        = Field(..., description="Location ID fulfilling from")
-    tracking_number:  Optional[str]              = Field(default=None)
-    tracking_company: Optional[str]              = Field(default=None, description="e.g. UPS, FedEx, USPS")
-    tracking_url:     Optional[str]              = Field(default=None)
-    line_items:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Specific line items (omit for all)")
-    notify_customer:  Optional[bool]             = Field(default=True, description="Send shipping notification email")
+    order_id: int = Field(..., description="Order ID to fulfill")
+    location_id: int = Field(..., description="Location ID fulfilling from")
+    tracking_number: Optional[str] = Field(default=None)
+    tracking_company: Optional[str] = Field(default=None, description="e.g. UPS, FedEx, USPS")
+    tracking_url: Optional[str] = Field(default=None)
+    line_items: Optional[List[Dict[str, Any]]] = Field(default=None, description="Specific line items (omit for all)")
+    notify_customer: Optional[bool] = Field(default=True, description="Send shipping notification email")
 
 
 @mcp.tool(
@@ -916,7 +920,7 @@ async def shopify_list_webhooks(params: ListWebhooksInput) -> str:
         p: Dict[str, Any] = {"limit": params.limit}
         if params.topic:
             p["topic"] = params.topic
-        data     = await _request("GET", "webhooks.json", params=p)
+        data = await _request("GET", "webhooks.json", params=p)
         webhooks = data.get("webhooks", [])
         return _fmt({"count": len(webhooks), "webhooks": webhooks})
     except Exception as e:
@@ -925,9 +929,9 @@ async def shopify_list_webhooks(params: ListWebhooksInput) -> str:
 
 class CreateWebhookInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    topic:   str           = Field(..., description="Webhook topic, e.g. orders/create, products/update")
-    address: str           = Field(..., description="URL to receive the webhook POST")
-    format:  Optional[str] = Field(default="json", description="json or xml")
+    topic: str = Field(..., description="Webhook topic, e.g. orders/create, products/update")
+    address: str = Field(..., description="URL to receive the webhook POST")
+    format: Optional[str] = Field(default="json", description="json or xml")
 
 
 @mcp.tool(
@@ -938,7 +942,7 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
     """Create a new webhook subscription."""
     try:
         webhook = {"topic": params.topic, "address": params.address, "format": params.format}
-        data    = await _request("POST", "webhooks.json", body={"webhook": webhook})
+        data = await _request("POST", "webhooks.json", body={"webhook": webhook})
         return _fmt(data.get("webhook", data))
     except Exception as e:
         return _error(e)
