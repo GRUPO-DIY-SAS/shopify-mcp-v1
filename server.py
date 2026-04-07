@@ -729,7 +729,168 @@ async def shopify_get_collection_products(params: GetCollectionProductsInput) ->
         return _fmt({"count": len(products), "products": products})
     except Exception as e:
         return _error(e)
+      
+# ═══════════════════════════════════════════════════════════════════════════
+# COLLECTIONS — CRUD + SEO Metafields
+# ═══════════════════════════════════════════════════════════════════════════
 
+class GetCollectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_id:   int = Field(..., description="Collection ID")
+    collection_type: str = Field(default="smart", description="'smart' or 'custom'")
+
+@mcp.tool(
+    name="shopify_get_collection",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_collection(params: GetCollectionInput) -> str:
+    """Retrieve a single collection (smart or custom) by ID, including body_html and image."""
+    try:
+        endpoint = "smart_collections" if params.collection_type == "smart" else "custom_collections"
+        data = await _request("GET", f"{endpoint}/{params.collection_id}.json")
+        key = "smart_collection" if params.collection_type == "smart" else "custom_collection"
+        return _fmt(data.get(key, data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateCollectionInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    collection_id:   int           = Field(..., description="Collection ID to update")
+    collection_type: str           = Field(default="smart", description="'smart' or 'custom'")
+    title:           Optional[str] = Field(default=None)
+    handle:          Optional[str] = Field(default=None)
+    body_html:       Optional[str] = Field(default=None, description="HTML description for the collection page")
+    sort_order:      Optional[str] = Field(default=None, description="alpha-asc, alpha-desc, best-selling, created, created-desc, manual, price-asc, price-desc")
+    template_suffix: Optional[str] = Field(default=None)
+    published:       Optional[bool] = Field(default=None)
+
+@mcp.tool(
+    name="shopify_update_collection",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_collection(params: UpdateCollectionInput) -> str:
+    """Update an existing collection (smart or custom). Only provided fields are changed.
+    Use this to update SEO descriptions (body_html), titles, handles, and sort order."""
+    try:
+        endpoint = "smart_collections" if params.collection_type == "smart" else "custom_collections"
+        key = "smart_collection" if params.collection_type == "smart" else "custom_collection"
+        collection: Dict[str, Any] = {"id": params.collection_id}
+        for field in ["title", "handle", "body_html", "sort_order", "template_suffix", "published"]:
+            val = getattr(params, field)
+            if val is not None:
+                collection[field] = val
+        data = await _request("PUT", f"{endpoint}/{params.collection_id}.json", body={key: collection})
+        return _fmt(data.get(key, data))
+    except Exception as e:
+        return _error(e)
+
+
+class CreateCollectionInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    title:           str           = Field(..., min_length=1)
+    collection_type: str           = Field(default="custom", description="'custom' or 'smart'")
+    handle:          Optional[str] = Field(default=None)
+    body_html:       Optional[str] = Field(default=None)
+    sort_order:      Optional[str] = Field(default=None)
+    published:       Optional[bool] = Field(default=True)
+    rules:           Optional[List[Dict[str, Any]]] = Field(default=None, description="Smart collection rules (only for smart type)")
+
+@mcp.tool(
+    name="shopify_create_collection",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_collection(params: CreateCollectionInput) -> str:
+    """Create a new collection (custom or smart)."""
+    try:
+        endpoint = "smart_collections" if params.collection_type == "smart" else "custom_collections"
+        key = "smart_collection" if params.collection_type == "smart" else "custom_collection"
+        collection: Dict[str, Any] = {"title": params.title}
+        for field in ["handle", "body_html", "sort_order", "published"]:
+            val = getattr(params, field)
+            if val is not None:
+                collection[field] = val
+        if params.collection_type == "smart" and params.rules:
+            collection["rules"] = params.rules
+        data = await _request("POST", f"{endpoint}.json", body={key: collection})
+        return _fmt(data.get(key, data))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteCollectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_id:   int = Field(..., description="Collection ID to delete")
+    collection_type: str = Field(default="smart", description="'smart' or 'custom'")
+
+@mcp.tool(
+    name="shopify_delete_collection",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_collection(params: DeleteCollectionInput) -> str:
+    """Permanently delete a collection. This cannot be undone."""
+    try:
+        endpoint = "smart_collections" if params.collection_type == "smart" else "custom_collections"
+        await _request("DELETE", f"{endpoint}/{params.collection_id}.json")
+        return f"Collection {params.collection_id} deleted."
+    except Exception as e:
+        return _error(e)
+
+
+# ─── METAFIELDS (necesarios para SEO Title Tag + Meta Description) ──────────
+# En Shopify, el Title SEO y la Meta Description se guardan como metafields:
+#   namespace="global", key="title_tag"        → SEO title
+#   namespace="global", key="description_tag"  → SEO meta description
+
+class ListMetafieldsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    owner_id:        int = Field(..., description="Resource ID (collection, product, etc.)")
+    owner_resource:  str = Field(..., description="'collections', 'products', 'customers', 'orders'")
+
+@mcp.tool(
+    name="shopify_list_metafields",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_metafields(params: ListMetafieldsInput) -> str:
+    """List all metafields for a resource. Use this to read SEO title_tag and description_tag."""
+    try:
+        path = f"{params.owner_resource}/{params.owner_id}/metafields.json"
+        data = await _request("GET", path)
+        return _fmt({"count": len(data.get("metafields", [])), "metafields": data.get("metafields", [])})
+    except Exception as e:
+        return _error(e)
+
+
+class SetMetafieldInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    owner_id:       int           = Field(..., description="Resource ID (collection, product, etc.)")
+    owner_resource: str           = Field(..., description="'collections', 'products', 'customers', 'orders'")
+    namespace:      str           = Field(default="global", description="Use 'global' for SEO fields")
+    key:            str           = Field(..., description="Use 'title_tag' for SEO title, 'description_tag' for meta description")
+    value:          str           = Field(..., description="The value to set")
+    type:           str           = Field(default="single_line_text_field", description="Metafield type")
+
+@mcp.tool(
+    name="shopify_set_metafield",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_metafield(params: SetMetafieldInput) -> str:
+    """Create or update a metafield. CRITICAL for SEO: use namespace='global' with
+    key='title_tag' (SEO title) or key='description_tag' (meta description)."""
+    try:
+        path = f"{params.owner_resource}/{params.owner_id}/metafields.json"
+        body = {
+            "metafield": {
+                "namespace": params.namespace,
+                "key":       params.key,
+                "value":     params.value,
+                "type":      params.type,
+            }
+        }
+        data = await _request("POST", path, body=body)
+        return _fmt(data.get("metafield", data))
+    except Exception as e:
+        return _error(e)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # INVENTORY
