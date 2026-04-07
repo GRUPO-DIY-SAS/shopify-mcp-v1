@@ -1090,6 +1090,339 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
     except Exception as e:
         return _error(e)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# BLOGS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ListBlogsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit:    Optional[int] = Field(default=50, ge=1, le=250)
+    since_id: Optional[int] = Field(default=None, description="Return blogs after this ID")
+    fields:   Optional[str] = Field(default=None, description="Comma-separated fields to return")
+
+
+@mcp.tool(
+    name="shopify_list_blogs",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_blogs(params: ListBlogsInput) -> str:
+    """List all blogs in the store."""
+    try:
+        p: Dict[str, Any] = {"limit": params.limit}
+        for field in ["since_id", "fields"]:
+            val = getattr(params, field)
+            if val is not None:
+                p[field] = val
+        data  = await _request("GET", "blogs.json", params=p)
+        blogs = data.get("blogs", [])
+        return _fmt({"count": len(blogs), "blogs": blogs})
+    except Exception as e:
+        return _error(e)
+
+
+class GetBlogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="The Shopify blog ID")
+
+
+@mcp.tool(
+    name="shopify_get_blog",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_blog(params: GetBlogInput) -> str:
+    """Get a single blog by ID."""
+    try:
+        data = await _request("GET", f"blogs/{params.blog_id}.json")
+        return _fmt(data.get("blog", data))
+    except Exception as e:
+        return _error(e)
+
+
+class CreateBlogInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    title:         str           = Field(..., min_length=1, description="Blog title")
+    commentable:   Optional[str] = Field(default=None, description="no, moderate, or yes")
+    metafield_namespace: Optional[str] = Field(default=None)
+    metafield_key:       Optional[str] = Field(default=None)
+    metafield_value:     Optional[str] = Field(default=None)
+    metafield_type:      Optional[str] = Field(default=None)
+
+
+@mcp.tool(
+    name="shopify_create_blog",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_blog(params: CreateBlogInput) -> str:
+    """Create a new blog."""
+    try:
+        blog: Dict[str, Any] = {"title": params.title}
+        if params.commentable:
+            blog["commentable"] = params.commentable
+        data = await _request("POST", "blogs.json", body={"blog": blog})
+        return _fmt(data.get("blog", data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateBlogInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    blog_id:     int           = Field(..., description="Blog ID to update")
+    title:       Optional[str] = Field(default=None)
+    commentable: Optional[str] = Field(default=None, description="no, moderate, or yes")
+
+
+@mcp.tool(
+    name="shopify_update_blog",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_blog(params: UpdateBlogInput) -> str:
+    """Update an existing blog's settings."""
+    try:
+        blog: Dict[str, Any] = {}
+        for field in ["title", "commentable"]:
+            val = getattr(params, field)
+            if val is not None:
+                blog[field] = val
+        data = await _request("PUT", f"blogs/{params.blog_id}.json", body={"blog": blog})
+        return _fmt(data.get("blog", data))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteBlogInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: int = Field(..., description="Blog ID to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_blog",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_blog(params: DeleteBlogInput) -> str:
+    """Permanently delete a blog and all its articles."""
+    try:
+        await _request("DELETE", f"blogs/{params.blog_id}.json")
+        return f"Blog {params.blog_id} deleted."
+    except Exception as e:
+        return _error(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ARTICLES (Blog Posts)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ListArticlesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    blog_id:        int            = Field(..., description="Blog ID to list articles from")
+    limit:          Optional[int]  = Field(default=50, ge=1, le=250)
+    since_id:       Optional[int]  = Field(default=None)
+    status:         Optional[str]  = Field(default=None, description="published or draft")
+    author:         Optional[str]  = Field(default=None)
+    tag:            Optional[str]  = Field(default=None, description="Filter by tag")
+    published_at_min: Optional[str] = Field(default=None, description="ISO 8601 date")
+    published_at_max: Optional[str] = Field(default=None, description="ISO 8601 date")
+    fields:         Optional[str]  = Field(default=None, description="Comma-separated fields")
+
+
+@mcp.tool(
+    name="shopify_list_articles",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_articles(params: ListArticlesInput) -> str:
+    """List all articles in a blog, with optional filters."""
+    try:
+        p: Dict[str, Any] = {"limit": params.limit}
+        for field in ["since_id", "status", "author", "tag", "published_at_min", "published_at_max", "fields"]:
+            val = getattr(params, field)
+            if val is not None:
+                p[field] = val
+        data     = await _request("GET", f"blogs/{params.blog_id}/articles.json", params=p)
+        articles = data.get("articles", [])
+        return _fmt({"count": len(articles), "articles": articles})
+    except Exception as e:
+        return _error(e)
+
+
+class GetArticleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id:    int = Field(..., description="Blog ID")
+    article_id: int = Field(..., description="Article ID")
+
+
+@mcp.tool(
+    name="shopify_get_article",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_article(params: GetArticleInput) -> str:
+    """Get a single article by blog ID and article ID."""
+    try:
+        data = await _request("GET", f"blogs/{params.blog_id}/articles/{params.article_id}.json")
+        return _fmt(data.get("article", data))
+    except Exception as e:
+        return _error(e)
+
+
+class CreateArticleInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    blog_id:      int            = Field(..., description="Blog ID where the article will be created")
+    title:        str            = Field(..., min_length=1, description="Article title")
+    body_html:    Optional[str]  = Field(default=None, description="HTML content of the article")
+    author:       Optional[str]  = Field(default=None, description="Author name")
+    tags:         Optional[str]  = Field(default=None, description="Comma-separated tags")
+    summary_html: Optional[str]  = Field(default=None, description="HTML excerpt/summary")
+    published:    Optional[bool] = Field(default=None, description="True to publish immediately, False for draft")
+    published_at: Optional[str]  = Field(default=None, description="ISO 8601 publish date/time")
+    image_src:    Optional[str]  = Field(default=None, description="URL of the article's featured image")
+    image_alt:    Optional[str]  = Field(default=None, description="Alt text for featured image")
+    metafields:   Optional[List[Dict[str, Any]]] = Field(default=None, description="SEO metafields array")
+
+
+@mcp.tool(
+    name="shopify_create_article",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_create_article(params: CreateArticleInput) -> str:
+    """Create a new article (blog post) in a blog."""
+    try:
+        article: Dict[str, Any] = {"title": params.title}
+        for field in ["body_html", "author", "tags", "summary_html", "published", "published_at", "metafields"]:
+            val = getattr(params, field)
+            if val is not None:
+                article[field] = val
+        if params.image_src:
+            article["image"] = {"src": params.image_src}
+            if params.image_alt:
+                article["image"]["alt"] = params.image_alt
+        data = await _request("POST", f"blogs/{params.blog_id}/articles.json", body={"article": article})
+        return _fmt(data.get("article", data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateArticleInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    blog_id:      int            = Field(..., description="Blog ID")
+    article_id:   int            = Field(..., description="Article ID to update")
+    title:        Optional[str]  = Field(default=None)
+    body_html:    Optional[str]  = Field(default=None, description="Full HTML content")
+    author:       Optional[str]  = Field(default=None)
+    tags:         Optional[str]  = Field(default=None)
+    summary_html: Optional[str]  = Field(default=None, description="HTML excerpt/summary")
+    published:    Optional[bool] = Field(default=None, description="True = published, False = draft")
+    published_at: Optional[str]  = Field(default=None, description="ISO 8601 date")
+    image_src:    Optional[str]  = Field(default=None, description="Featured image URL")
+    image_alt:    Optional[str]  = Field(default=None, description="Alt text for featured image")
+    metafields:   Optional[List[Dict[str, Any]]] = Field(default=None)
+
+
+@mcp.tool(
+    name="shopify_update_article",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_article(params: UpdateArticleInput) -> str:
+    """Update an existing article. Only provided fields are changed."""
+    try:
+        article: Dict[str, Any] = {}
+        for field in ["title", "body_html", "author", "tags", "summary_html", "published", "published_at", "metafields"]:
+            val = getattr(params, field)
+            if val is not None:
+                article[field] = val
+        if params.image_src:
+            article["image"] = {"src": params.image_src}
+            if params.image_alt:
+                article["image"]["alt"] = params.image_alt
+        data = await _request(
+            "PUT",
+            f"blogs/{params.blog_id}/articles/{params.article_id}.json",
+            body={"article": article},
+        )
+        return _fmt(data.get("article", data))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteArticleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id:    int = Field(..., description="Blog ID")
+    article_id: int = Field(..., description="Article ID to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_article",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_article(params: DeleteArticleInput) -> str:
+    """Permanently delete an article."""
+    try:
+        await _request("DELETE", f"blogs/{params.blog_id}/articles/{params.article_id}.json")
+        return f"Article {params.article_id} deleted from blog {params.blog_id}."
+    except Exception as e:
+        return _error(e)
+
+
+class CountArticlesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id:   int           = Field(..., description="Blog ID")
+    published: Optional[bool] = Field(default=None, description="True = published only, False = drafts only")
+
+
+@mcp.tool(
+    name="shopify_count_articles",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_count_articles(params: CountArticlesInput) -> str:
+    """Count articles in a blog."""
+    try:
+        p: Dict[str, Any] = {}
+        if params.published is not None:
+            p["published_status"] = "published" if params.published else "unpublished"
+        data = await _request("GET", f"blogs/{params.blog_id}/articles/count.json", params=p)
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class ListArticleAuthorsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+@mcp.tool(
+    name="shopify_list_article_authors",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_article_authors(params: ListArticleAuthorsInput) -> str:
+    """List all unique article authors in the store."""
+    try:
+        data = await _request("GET", "articles/authors.json")
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
+
+
+class ListArticleTagsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blog_id: Optional[int] = Field(default=None, description="Filter by blog ID (optional)")
+    limit:   Optional[int] = Field(default=None, ge=1, le=250, description="Max tags to return")
+    popular: Optional[bool] = Field(default=None, description="Return only popular tags")
+
+
+@mcp.tool(
+    name="shopify_list_article_tags",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_article_tags(params: ListArticleTagsInput) -> str:
+    """List all tags used in articles across the store or a specific blog."""
+    try:
+        p: Dict[str, Any] = {}
+        if params.limit:
+            p["limit"] = params.limit
+        if params.popular is not None:
+            p["popular"] = 1 if params.popular else 0
+        path = f"blogs/{params.blog_id}/articles/tags.json" if params.blog_id else "articles/tags.json"
+        data = await _request("GET", path, params=p)
+        return _fmt(data)
+    except Exception as e:
+        return _error(e)
 
 # ---------------------------------------------------------------------------
 # Entrypoint
